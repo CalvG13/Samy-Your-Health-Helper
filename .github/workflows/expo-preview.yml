@@ -6,12 +6,13 @@
 #   2. expo.dev → Account settings → Access tokens → create a personal token.
 #   3. GitHub → Settings → Secrets and variables → Actions → add it as EXPO_TOKEN.
 #
-# Then: Actions → "Expo Go preview" → Run workflow. Open the "Preview is online"
-# step for the Expo Go URL and QR code. Expo Go must be signed in to the same
-# account, because projects opened over the internet must be signed by it.
+# Then: Actions → "Expo Go preview" → Run workflow with a random code. The URL is
+# exp://<code>-<expo username>-8081.exp.direct (also printed, with a QR code, in the
+# "Preview is online" step). Expo Go must be signed in to the same account, because
+# projects opened over the internet must be signed by it.
 name: Expo Go preview
 
-run-name: "Expo Go preview · ${{ inputs.code }}"
+run-name: Expo Go preview
 
 on:
   workflow_dispatch:
@@ -38,7 +39,7 @@ concurrency:
 jobs:
   preview:
     runs-on: ubuntu-latest
-    timeout-minutes: 140
+    timeout-minutes: 170
     env:
       CI: "1"
       EXPO_NO_TELEMETRY: "1"
@@ -46,6 +47,9 @@ jobs:
       TUNNEL_CODE: ${{ inputs.code }}
       EXPECTED_USERNAME: ${{ inputs.expo_username }}
       PREVIEW_MINUTES: ${{ inputs.minutes }}
+      # Optional repository variables; the app falls back to mock data when they're unset.
+      EXPO_PUBLIC_SUPABASE_URL: ${{ vars.EXPO_PUBLIC_SUPABASE_URL }}
+      EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
     steps:
       - name: Validate inputs
         run: |
@@ -55,7 +59,7 @@ jobs:
           if [[ ! "$TUNNEL_CODE" =~ ^[a-z0-9]{6,24}$ ]]; then
             echo "::error::code must be 6-24 lowercase letters or digits"; exit 1
           fi
-          if [[ ! "$PREVIEW_MINUTES" =~ ^[0-9]+$ ]] || (( PREVIEW_MINUTES < 1 || PREVIEW_MINUTES > 120 )); then
+          if [[ ! "$PREVIEW_MINUTES" =~ ^[1-9][0-9]{0,2}$ ]] || (( 10#$PREVIEW_MINUTES > 120 )); then
             echo "::error::minutes must be a whole number from 1 to 120"; exit 1
           fi
 
@@ -122,6 +126,11 @@ jobs:
             served_id=$(curl -fsS --max-time 10 -H "expo-platform: ios" -H "accept: application/expo+json" \
               "https://$TUNNEL_HOST/" 2>/dev/null | jq -r '.extra.eas.projectId // empty' 2>/dev/null) || served_id=""
             if [[ -n "$served_id" && "$served_id" == "$EXPO_PROJECT_ID" ]]; then
+              # The CLI silently moves to a random hostname on a name conflict and rewrites this file.
+              if [[ "$(jq -r '.urlRandomness // empty' .expo/settings.json)" != "$TUNNEL_CODE" ]]; then
+                echo "::error::Tunnel hostname changed after a conflict; re-run with a different code."
+                cat "$RUNNER_TEMP/expo.log"; exit 1
+              fi
               echo "Tunnel is live: exp://$TUNNEL_HOST"
               break
             fi
@@ -149,9 +158,12 @@ jobs:
           fi
           echo "Manifest is signed for Expo Go"
 
-          # Best effort: pre-build the iOS and Android bundles so the first open in Expo Go is fast.
+      - name: Pre-build bundles
+        continue-on-error: true
+        run: |
+          # Best effort: build the iOS and Android bundles now so the first open in Expo Go is fast.
           for platform in ios android; do
-            bundle_url=$(curl -fsS -H "expo-platform: $platform" -H "accept: application/expo+json" \
+            bundle_url=$(curl -fsS --max-time 60 -H "expo-platform: $platform" -H "accept: application/expo+json" \
               http://localhost:8081/ 2>/dev/null | jq -r '.launchAsset.url // empty' 2>/dev/null) || bundle_url=""
             if [[ -n "$bundle_url" ]]; then
               local_url=$(sed -E 's#^https?://[^/]+#http://localhost:8081#' <<< "$bundle_url")
@@ -160,17 +172,35 @@ jobs:
             fi
           done
 
-          {
-            echo "### Open in Expo Go"
-            echo
-            echo "\`exp://$TUNNEL_HOST\`"
-            echo
-            echo "Sign in to Expo Go with the same Expo account as EXPO_TOKEN. Online for $PREVIEW_MINUTES minutes."
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preview is online (scan the QR code in Expo Go)
         run: |
           echo "Expo Go URL: exp://$TUNNEL_HOST"
-          npx --yes qrcode-terminal@0.12.0 "exp://$TUNNEL_HOST" || true
-          echo "Streaming dev server logs for $PREVIEW_MINUTES minutes. Cancel the run to stop early."
-          timeout "${PREVIEW_MINUTES}m" tail -n +1 -f "$RUNNER_TEMP/expo.log" || true
+          # qrcode-terminal ignores its argument when stdin isn't a TTY, so pipe the URL in.
+          printf '%s\n' "exp://$TUNNEL_HOST" | npx --yes qrcode-terminal@0.12.0 || true
+          {
+            echo "### Expo Go preview"
+            echo
+            echo "\`exp://$TUNNEL_HOST\` (only works while this run is in progress)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Online for $PREVIEW_MINUTES minutes. Cancel the run to stop early."
+          tail -n +1 -f "$RUNNER_TEMP/expo.log" &
+          end=$(( $(date +%s) + 10#$PREVIEW_MINUTES * 60 ))
+          fails=0
+          # Fail the job (visible in the run status) if the server or tunnel dies mid-preview.
+          while (( $(date +%s) < end )); do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/expo.pid")" 2>/dev/null; then
+              echo "::error::Expo dev server exited"; exit 1
+            fi
+            if curl -fsS --max-time 10 "https://$TUNNEL_HOST/status" 2>/dev/null | grep -q "packager-status:running"; then
+              fails=0
+            else
+              fails=$((fails + 1))
+              if (( fails >= 4 )); then
+                echo "::error::Tunnel stopped responding"; exit 1
+              fi
+            fi
+            sleep 30
+          done
+          echo "Preview time is up."
