@@ -1,0 +1,112 @@
+# Hosts the Expo dev server on a GitHub runner and exposes it through Expo's
+# tunnel, so the app can be opened in Expo Go on any phone without a local setup.
+#
+# Actions → "Expo Go preview" → Run workflow. The Expo Go URL is shown in the run
+# title; scan it as a QR code (or paste it into Expo Go → "Enter URL manually").
+name: Expo Go preview
+
+run-name: "Expo Go preview · exp://${{ inputs.code }}-anonymous-8081.exp.direct"
+
+on:
+  workflow_dispatch:
+    inputs:
+      code:
+        description: "Tunnel code: 6-24 lowercase letters/digits. The URL becomes exp://<code>-anonymous-8081.exp.direct"
+        required: true
+        default: "samypreview"
+      minutes:
+        description: "How long to keep the preview online (max 120)"
+        required: true
+        default: "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: expo-preview
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    env:
+      CI: "1"
+      EXPO_NO_TELEMETRY: "1"
+      TUNNEL_CODE: ${{ inputs.code }}
+      PREVIEW_MINUTES: ${{ inputs.minutes }}
+    steps:
+      - name: Validate inputs
+        run: |
+          if [[ ! "$TUNNEL_CODE" =~ ^[a-z0-9]{6,24}$ ]]; then
+            echo "::error::code must be 6-24 lowercase letters or digits"; exit 1
+          fi
+          if [[ ! "$PREVIEW_MINUTES" =~ ^[0-9]+$ ]] || (( PREVIEW_MINUTES < 1 || PREVIEW_MINUTES > 120 )); then
+            echo "::error::minutes must be a whole number from 1 to 120"; exit 1
+          fi
+          echo "TUNNEL_HOST=${TUNNEL_CODE}-anonymous-8081.exp.direct" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm ci --no-audit --no-fund
+          # Expo's tunnel client; resolved from the project so the CLI never prompts to install it.
+          npm install --no-save --no-audit --no-fund @expo/ngrok@^4.1.0
+
+      - name: Start dev server and tunnel
+        run: |
+          # The tunnel hostname is <urlRandomness>-<username>-<port>.exp.direct; pinning the
+          # randomness (and running logged out, so username is "anonymous") makes it predictable.
+          mkdir -p .expo
+          printf '{"urlRandomness":"%s"}\n' "$TUNNEL_CODE" > .expo/settings.json
+
+          nohup npx expo start --tunnel --port 8081 > "$RUNNER_TEMP/expo.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/expo.pid"
+
+          # Succeed only once the dev server answers through the public tunnel URL.
+          for attempt in $(seq 1 90); do
+            if curl -fsS --max-time 5 "https://$TUNNEL_HOST/status" 2>/dev/null | grep -q "packager-status:running"; then
+              echo "Tunnel is live: exp://$TUNNEL_HOST"
+              break
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/expo.pid")" 2>/dev/null; then
+              echo "::error::Expo dev server exited"; cat "$RUNNER_TEMP/expo.log"; exit 1
+            fi
+            if [[ $attempt -eq 90 ]]; then
+              echo "::error::Tunnel did not come up at https://$TUNNEL_HOST"; cat "$RUNNER_TEMP/expo.log"; exit 1
+            fi
+            sleep 2
+          done
+
+          # Pre-build the iOS and Android bundles so the first open in Expo Go is fast.
+          # Best effort: a failure here must not fail the step once the tunnel is up.
+          for platform in ios android; do
+            bundle_url=$(curl -fsS -H "expo-platform: $platform" -H "accept: application/expo+json" \
+              http://localhost:8081/ 2>/dev/null | jq -r '.launchAsset.url // empty' 2>/dev/null) || bundle_url=""
+            if [[ -n "$bundle_url" ]]; then
+              local_url=$(sed -E 's#^https?://[^/]+#http://localhost:8081#' <<< "$bundle_url")
+              curl -fsS --max-time 600 -o /dev/null "$local_url" && echo "Pre-built $platform bundle" \
+                || echo "::warning::Could not pre-build the $platform bundle"
+            fi
+          done
+
+          {
+            echo "### Open in Expo Go"
+            echo
+            echo "\`exp://$TUNNEL_HOST\`"
+            echo
+            echo "Online for $PREVIEW_MINUTES minutes from when this step finished."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preview is online (scan the QR code in Expo Go)
+        run: |
+          echo "Expo Go URL: exp://$TUNNEL_HOST"
+          npx --yes qrcode-terminal@0.12.0 "exp://$TUNNEL_HOST" || true
+          echo "Streaming dev server logs for $PREVIEW_MINUTES minutes. Cancel the run to stop early."
+          timeout "${PREVIEW_MINUTES}m" tail -n +1 -f "$RUNNER_TEMP/expo.log" || true
