@@ -1,19 +1,28 @@
 # Hosts the Expo dev server on a GitHub runner and exposes it through Expo's
 # tunnel, so the app can be opened in Expo Go on any phone without a local setup.
 #
-# Actions → "Expo Go preview" → Run workflow. The Expo Go URL is shown in the run
-# title; scan it as a QR code (or paste it into Expo Go → "Enter URL manually").
+# One-time setup:
+#   1. Create a free Expo account and sign in to the Expo Go app with it.
+#   2. expo.dev → Account settings → Access tokens → create a personal token.
+#   3. GitHub → Settings → Secrets and variables → Actions → add it as EXPO_TOKEN.
+#
+# Then: Actions → "Expo Go preview" → Run workflow. Open the "Preview is online"
+# step for the Expo Go URL and QR code. Expo Go must be signed in to the same
+# account, because projects opened over the internet must be signed by it.
 name: Expo Go preview
 
-run-name: "Expo Go preview · exp://${{ inputs.code }}-anonymous-8081.exp.direct"
+run-name: "Expo Go preview · ${{ inputs.code }}"
 
 on:
   workflow_dispatch:
     inputs:
       code:
-        description: "Tunnel code: 6-24 lowercase letters/digits. The URL becomes exp://<code>-anonymous-8081.exp.direct"
+        description: "Tunnel code, 6-24 lowercase letters/digits. URL: exp://<code>-<expo username>-8081.exp.direct"
         required: true
-        default: "samypreview"
+      expo_username:
+        description: "Your Expo username (optional; if set, must match the EXPO_TOKEN account)"
+        required: false
+        default: ""
       minutes:
         description: "How long to keep the preview online (max 120)"
         required: true
@@ -33,18 +42,22 @@ jobs:
     env:
       CI: "1"
       EXPO_NO_TELEMETRY: "1"
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
       TUNNEL_CODE: ${{ inputs.code }}
+      EXPECTED_USERNAME: ${{ inputs.expo_username }}
       PREVIEW_MINUTES: ${{ inputs.minutes }}
     steps:
       - name: Validate inputs
         run: |
+          if [[ -z "$EXPO_TOKEN" ]]; then
+            echo "::error::Add a personal Expo access token as the EXPO_TOKEN repository secret (see the top of this workflow)."; exit 1
+          fi
           if [[ ! "$TUNNEL_CODE" =~ ^[a-z0-9]{6,24}$ ]]; then
             echo "::error::code must be 6-24 lowercase letters or digits"; exit 1
           fi
           if [[ ! "$PREVIEW_MINUTES" =~ ^[0-9]+$ ]] || (( PREVIEW_MINUTES < 1 || PREVIEW_MINUTES > 120 )); then
             echo "::error::minutes must be a whole number from 1 to 120"; exit 1
           fi
-          echo "TUNNEL_HOST=${TUNNEL_CODE}-anonymous-8081.exp.direct" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v5
 
@@ -59,33 +72,84 @@ jobs:
           # Expo's tunnel client; resolved from the project so the CLI never prompts to install it.
           npm install --no-save --no-audit --no-fund @expo/ngrok@^4.1.0
 
+      - name: Link Expo account and project
+        run: |
+          EXPO_USER=$(npx expo whoami 2>/dev/null | tail -n 1 | tr -d '[:space:]') || EXPO_USER=""
+          if [[ -z "$EXPO_USER" || "$EXPO_USER" == "Notloggedin" ]]; then
+            echo "::error::EXPO_TOKEN was rejected by Expo. Create a new personal access token and update the secret."; exit 1
+          fi
+          if [[ "$EXPO_USER" == *"(robot)"* || "$EXPO_USER" == "robot" ]]; then
+            echo "::error::EXPO_TOKEN is a robot token. Expo tunnels need a personal access token."; exit 1
+          fi
+          if [[ -n "$EXPECTED_USERNAME" && "${EXPO_USER,,}" != "${EXPECTED_USERNAME,,}" ]]; then
+            echo "::error::EXPO_TOKEN belongs to @$EXPO_USER, not @$EXPECTED_USERNAME."; exit 1
+          fi
+          echo "Signed in to Expo as @$EXPO_USER"
+
+          # Creates @<user>/samy-your-health-helper on first run, links it afterwards. Expo Go only
+          # opens remote projects whose manifest is signed with this project's development certificate.
+          npx --yes eas-cli@24.12.1 init --account "$EXPO_USER" --non-interactive --force
+
+          project_id=$(node -p 'require("./app.json").expo.extra?.eas?.projectId ?? ""')
+          if [[ ! "$project_id" =~ ^[0-9a-f-]{36}$ ]]; then
+            echo "::error::eas init did not link an Expo project (got '$project_id')."; exit 1
+          fi
+          # Same slug the CLI uses for the tunnel hostname (<urlRandomness>-<username>-<port>.exp.direct).
+          user_slug=$(node -e '
+            const cli = require.resolve("@expo/cli/package.json", { paths: [require.resolve("expo/package.json")] });
+            const slugify = require(require.resolve("slugify", { paths: [cli] }));
+            console.log(slugify(process.argv[1], { remove: /\./ }));
+          ' "$EXPO_USER")
+          {
+            echo "EXPO_PROJECT_ID=$project_id"
+            echo "TUNNEL_HOST=${TUNNEL_CODE}-${user_slug}-8081.exp.direct"
+          } >> "$GITHUB_ENV"
+
       - name: Start dev server and tunnel
         run: |
-          # The tunnel hostname is <urlRandomness>-<username>-<port>.exp.direct; pinning the
-          # randomness (and running logged out, so username is "anonymous") makes it predictable.
           mkdir -p .expo
           printf '{"urlRandomness":"%s"}\n' "$TUNNEL_CODE" > .expo/settings.json
 
-          nohup npx expo start --tunnel --port 8081 > "$RUNNER_TEMP/expo.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/expo.pid"
+          start_expo() {
+            nohup npx expo start --tunnel --port 8081 >> "$RUNNER_TEMP/expo.log" 2>&1 &
+            echo $! > "$RUNNER_TEMP/expo.pid"
+          }
 
-          # Succeed only once the dev server answers through the public tunnel URL.
-          for attempt in $(seq 1 90); do
-            if curl -fsS --max-time 5 "https://$TUNNEL_HOST/status" 2>/dev/null | grep -q "packager-status:running"; then
+          # Succeed only once this project's dev server answers through the public tunnel.
+          launches=1
+          start_expo
+          for attempt in $(seq 1 120); do
+            served_id=$(curl -fsS --max-time 10 -H "expo-platform: ios" -H "accept: application/expo+json" \
+              "https://$TUNNEL_HOST/" 2>/dev/null | jq -r '.extra.eas.projectId // empty' 2>/dev/null) || served_id=""
+            if [[ -n "$served_id" && "$served_id" == "$EXPO_PROJECT_ID" ]]; then
               echo "Tunnel is live: exp://$TUNNEL_HOST"
               break
             fi
             if ! kill -0 "$(cat "$RUNNER_TEMP/expo.pid")" 2>/dev/null; then
-              echo "::error::Expo dev server exited"; cat "$RUNNER_TEMP/expo.log"; exit 1
+              if (( launches < 2 )); then
+                echo "::warning::Expo dev server exited; retrying once"; launches=$((launches + 1)); start_expo
+              else
+                echo "::error::Expo dev server exited"; cat "$RUNNER_TEMP/expo.log"; exit 1
+              fi
             fi
-            if [[ $attempt -eq 90 ]]; then
+            if [[ $attempt -eq 120 ]]; then
               echo "::error::Tunnel did not come up at https://$TUNNEL_HOST"; cat "$RUNNER_TEMP/expo.log"; exit 1
             fi
             sleep 2
           done
 
-          # Pre-build the iOS and Android bundles so the first open in Expo Go is fast.
-          # Best effort: a failure here must not fail the step once the tunnel is up.
+          # Ask for a signed manifest the way Expo Go does. Without a signature Expo Go refuses to
+          # open the project ("You need to be signed in to Expo Go and Expo CLI").
+          if ! curl -fsS --max-time 30 -o /dev/null -D - \
+              -H "expo-platform: ios" -H "accept: application/expo+json" \
+              -H 'expo-expect-signature: sig, keyid="expo-root", alg="rsa-v1_5-sha256"' \
+              "https://$TUNNEL_HOST/" | grep -qi '^expo-signature:'; then
+            echo "::error::The dev server is not signing manifests, so Expo Go would refuse to open it."
+            cat "$RUNNER_TEMP/expo.log"; exit 1
+          fi
+          echo "Manifest is signed for Expo Go"
+
+          # Best effort: pre-build the iOS and Android bundles so the first open in Expo Go is fast.
           for platform in ios android; do
             bundle_url=$(curl -fsS -H "expo-platform: $platform" -H "accept: application/expo+json" \
               http://localhost:8081/ 2>/dev/null | jq -r '.launchAsset.url // empty' 2>/dev/null) || bundle_url=""
@@ -101,7 +165,7 @@ jobs:
             echo
             echo "\`exp://$TUNNEL_HOST\`"
             echo
-            echo "Online for $PREVIEW_MINUTES minutes from when this step finished."
+            echo "Sign in to Expo Go with the same Expo account as EXPO_TOKEN. Online for $PREVIEW_MINUTES minutes."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preview is online (scan the QR code in Expo Go)
